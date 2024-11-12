@@ -1,3 +1,9 @@
+# Update Fall 2024
+
+New functionality has been added over the fall, including functionality to handle Blueskys new video functions. Another new function is cross-deletion, meaning if you delete a post within one hour of posting it on Bluesky, it will also be deleted on the other platforms. This function can be disabled in settings by setting cross_delete to False.
+
+This will probably be the last update for a while, except for some bug fixes if needed. Before further updates the poster would probably need some major rewrites to make it be less of a mess.
+
 # Mk 2
 
 Version 2 of the crossposter has now been released. The new version contains a bunch of new options, along with fixes and restructuring. To start using the new version I recommend making a new, separate installation and transferring your settings and database to the new version. 
@@ -12,9 +18,9 @@ New functions include:
 
 The Bluesky Crossposter is a python script that when running will automatically post your bluesky-posts to mastodon and twitter, excluding responses and reposts. The script can handle threads, quote posts of your own posts, and image posts, including alt text on images. 
 
-To get started, get the necessary keys and passwords and enter them in auth.py. Then fill in your paths in path.py. Finally set up a way for the code to be run periodically, for example a cronjob running every five or ten minutes.
+To get started, get the necessary keys and passwords and enter them in settings/auth.py. Then fill in your paths in settings/path.py. Finally set up a way for the code to be run periodically, for example a cronjob running every five or ten minutes.
 
-When first run, or run without a database file, all posts within the timelimit set by postTimeLimit in settings.py will be posted.
+When first run, or run without a database file, all posts within the timelimit set by postTimeLimit in settings/settings.py will be posted.
 
 In the settings.py you can also disable posting to twitter or mastodon if you only want to post to one of them. Just change "True" to "False" for the service you want to disable. You can also disable logging if you have limited space where the program will run.
 

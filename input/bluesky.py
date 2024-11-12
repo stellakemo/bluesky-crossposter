@@ -1,29 +1,52 @@
-from atproto import Client
+from loguru import logger
 from settings.auth import BSKY_HANDLE, BSKY_PASSWORD
 from settings.paths import *
 from settings import settings
-from local.functions import write_log, lang_toggle
-import arrow
+from local.functions import RateLimitedClient, lang_toggle, rate_limit_write, session_cache_read, session_cache_write, on_session_change
+import arrow, os
 
 date_in_format = 'YYYY-MM-DDTHH:mm:ss'
 
 # Setting up connections to bluesky, twitter and mastodon
-
-bsky = Client()
-bsky.login(BSKY_HANDLE, BSKY_PASSWORD)
+def bsky_connect():
+    try:
+        bsky = RateLimitedClient()
+        bsky.on_session_change(on_session_change)
+        session = session_cache_read()
+        if session:
+            logger.info("Connecting to Bluesky using saved session.")
+            bsky.login(session_string=session)
+        else:
+            logger.info("Creating new Bluesky session using password and username.")
+            bsky.login(BSKY_HANDLE, BSKY_PASSWORD)
+        session = bsky.export_session_string()
+        session_cache_write(session)
+        return bsky
+    except Exception as e:
+        logger.error(e)
+        if e.response.content.error == "RateLimitExceeded":
+            ratelimit_reset = e.response.headers["RateLimit-Reset"]
+            rate_limit_write(ratelimit_reset)
+        elif e.response.content.error == "ExpiredToken":
+            logger.info("Session expired, removing session file.")
+            os.remove(session_cache_path)
+        exit()
 
 # Getting posts from bluesky
 
-def get_posts(timelimit = arrow.utcnow().shift(hours = -1)):
-    write_log("Gathering posts")
+def get_posts(timelimit = arrow.utcnow().shift(hours = -1), deleted = []):
+    bsky = bsky_connect()
+    logger.info("Gathering posts")
     posts = {}
     # Getting feed of user
     profile_feed = bsky.app.bsky.feed.get_author_feed({'actor': BSKY_HANDLE})
     visibility = settings.visibility
     for feed_view in profile_feed.feed:
-        # If the post was not written by the account that posted it, it is a repost and we skip it.
+#        logger.debug(feed_view)
+        # If the post was not written by the account that posted it, it is a repost from another account and we skip it.
         if feed_view.post.author.handle != BSKY_HANDLE:
             continue
+        # Checking if the post has "indexe_at" set, meaning it is a repost.
         repost = False
         created_at = arrow.get(feed_view.post.record.created_at.split(".")[0], date_in_format)
         if hasattr(feed_view.reason, "indexed_at"):
@@ -38,9 +61,11 @@ def get_posts(timelimit = arrow.utcnow().shift(hours = -1)):
         twitter_post = (lang_toggle(langs, "twitter") and settings.Twitter)
         if not mastodon_post and not twitter_post:
             continue
-        # If post has an embed of type record it is a quote post, and should not be crossposted
         cid = feed_view.post.cid
         text = feed_view.post.record.text
+        # Checking if there are any posts in the cache that are no longer in the timeline, meaning they have been deleted.
+        if cid in deleted:
+            deleted.remove(cid)
         # Facets contains things like urls and mentions, which we need to deal with.
         # send_mention is used to keep track of if the mention-settings says for the post to be posted or not.
         # Default is True, because if nobody is mentioned it should be posted.
@@ -74,7 +99,7 @@ def get_posts(timelimit = arrow.utcnow().shift(hours = -1)):
             try:
                 quoted_user, quoted_post, quote_url, open = get_quote_post(feed_view.post.embed.record)
             except:
-                write_log("Post " + cid + " is of a type the crossposter can't parse.", "error")
+                logger.error("Post " + cid + " is of a type the crossposter can't parse.")
                 continue
             # If post is a quote post of a post from another user, and quote-posting is disabled in settings
             # or the post is not open to users not logged in, the post will be skipped
@@ -94,28 +119,41 @@ def get_posts(timelimit = arrow.utcnow().shift(hours = -1)):
             try:
                 reply_to_user = feed_view.reply.parent.author.handle
             except:
-                reply_to_user = get_reply_to_user(feed_view.post.record.reply.parent)
+                reply_to_user = bsky.get_reply_to_user(feed_view.post.record.reply.parent)
         # If unable to fetch user that was replied to, code will skip this post. If the post was not a 
         # reply at all, the reply_to_user will still be set to the user account.
         if not reply_to_user:
-            write_log("Unable to find the user that post " + cid + " replies to or quotes", "error")
+            logger.info("Unable to find the user that post " + cid + " replies to or quotes")
             continue
         # Checking if post is withing timelimit and not a reply to someone elses post.
         if created_at > timelimit and reply_to_user == BSKY_HANDLE:
             # Fetching images if there are any in the post
             image_data = ""
-            images = []
+            video_data = {}
+            media = {}
             if feed_view.post.embed and hasattr(feed_view.post.embed, "images"):
                 image_data = feed_view.post.embed.images
             elif feed_view.post.embed and hasattr(feed_view.post.embed, "media") and hasattr(feed_view.post.embed.media, "images"):
                 image_data = feed_view.post.embed.media.images
+            elif  feed_view.post.record.embed and hasattr(feed_view.post.record.embed, "video"):
+                video_data = get_video_data(feed_view)
+                media = {
+                    "type": "video",
+                    "data": video_data
+                }
+                logger.debug("Found video: %s" % video_data)
             # Sometimes posts have included links that are not included in the actual text of the post. This adds adds that back.
             if feed_view.post.embed and hasattr(feed_view.post.embed, "external") and hasattr(feed_view.post.embed.external, "uri"):
                 if feed_view.post.embed.external.uri not in text:
                     text += '\n'+feed_view.post.embed.external.uri
             if image_data:
+                images = []
                 for image in image_data:
                     images.append({"url": image.fullsize, "alt": image.alt})
+                media = {
+                    "type": "image",
+                    "data": images
+                }
             if visibility == "hybrid" and reply_to_post:
                 visibility = "unlisted"
             elif visibility == "hybrid":
@@ -125,7 +163,7 @@ def get_posts(timelimit = arrow.utcnow().shift(hours = -1)):
                 "reply_to_post": reply_to_post,
                 "quoted_post": quoted_post,
                 "quote_url": quote_url,
-                "images": images,
+                "media": media,
                 "visibility": visibility,
                 "twitter": twitter_post,
                 "mastodon": mastodon_post,
@@ -133,22 +171,10 @@ def get_posts(timelimit = arrow.utcnow().shift(hours = -1)):
                 "repost": repost,
                 "timestamp": created_at
             }
+            logger.debug(post_info)
             # Saving post to posts dictionary
             posts[cid] = post_info;
-    return posts
-
-# Function for getting username of person replied to. It can mostly be retrieved from the reply section of the tweet that has been fetched,
-# but in cases where the original post in a thread has been deleted it causes some weirdness. Hopefully this resolves it.
-def get_reply_to_user(reply):
-    uri = reply.uri
-    username = ""
-    try: 
-        response = bsky.app.bsky.feed.get_post_thread(params={"uri": uri})
-        username = response.thread.post.author.handle
-    except:
-        write_log("Unable to retrieve reply_to-user of post.", "error")
-    return username
-
+    return posts, deleted
 
 def get_allowed_reply(post):
         reply_restriction = post.threadgate
@@ -233,3 +259,14 @@ def get_quote_post(post):
         open = False
     url = "https://bsky.app/profile/" + user + "/post/" + uri.split("/")[-1]
     return user, cid, url, open
+
+
+def get_video_data(post_data):
+    did = post_data["post"]["author"]["did"]
+    blob_cid = post_data["post"]["record"]["embed"]["video"].ref.link
+    url = "https://bsky.social/xrpc/com.atproto.sync.getBlob?did=%s&cid=%s" % (did, blob_cid)
+    alt = post_data["post"]["record"]["embed"]["alt"]
+    # Setting alt to empty string if it is noneType
+    if not alt:
+        alt = ""
+    return {"url": url, "alt": alt}
